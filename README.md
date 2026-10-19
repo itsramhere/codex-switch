@@ -15,6 +15,7 @@ Every account keeps using the **same** Codex home folder, so all accounts automa
 ```bash
 codex-switch import account1    # save the account you are already logged in with
 codex-switch login  account2    # browser sign-in for your second account
+codex-switch limits             # see how much of each account's quota is left
 codex-switch next               # switch between them whenever you like
 ```
 
@@ -109,6 +110,41 @@ use `codex-switch login account1`.
 
 Done. From now on a single command switches accounts.
 
+## Checking your remaining limits
+
+`codex-switch limits` asks OpenAI for the live usage of **every** saved account —
+not just the active one — so you can see which account has room before switching:
+
+```
+$ codex-switch limits
+Reading live usage for 2 account(s) from OpenAI...
+
+  ACCOUNT        PLAN    WINDOW REMAINING
+  ----------------------------------------------------------------------------
+* account1       plus    5h      86% left [#########-]  resets in 4h 47m (18:42)
+                         1w      53% left [#####-----]  resets in 5d 23h (Sun 13:01)
+                         1 rate-limit reset credit(s) available
+  account2       plus    5h       1% left [----------]  resets in 38m (14:32)
+                         1w      63% left [######----]  resets in 6d 6h (Sun 20:49)
+
+  * = active account
+```
+
+- `5h` / `1w` are the rolling windows reported by the backend (Codex shows the
+  same two bars), with the percentage **remaining** and when each one resets.
+- The bar is green at 50%+ remaining, yellow below 50%, and red below 20%, so
+  you can see at a glance when an account is nearly spent.
+- Any "rate-limit reset credits" your plan has available are listed too.
+- `n/a` for an account means its saved login has expired — refresh it with
+  `codex-switch login <name>`.
+
+How it works: the command runs a short-lived, isolated Codex app-server in a
+temporary folder seeded with that account's saved login, reads
+`account/rateLimits/read`, then shuts it down. **It never changes your active
+account or touches your live `auth.json`**, and if OpenAI rotates the tokens
+during the read, the refreshed snapshot is written back so your saved logins
+stay valid. Reading takes a few seconds per account.
+
 ## Daily use
 
 When one account hits its usage/rate limit:
@@ -131,6 +167,7 @@ it all in one go.
 | `codex-switch next` | Switch to the next saved account (with 2 accounts: toggles) |
 | `codex-switch use <name>` | Switch to a specific saved account |
 | `codex-switch list` | Show saved accounts and which one is active (`ls`, `status`) |
+| `codex-switch limits` | Show live rate-limit usage for every saved account (`usage`) |
 | `codex-switch whoami` | Show the account Codex is currently logged in with |
 | `codex-switch import <name>` | Save the current login as `<name>` |
 | `codex-switch login <name>` | Log in a new account (browser flow) and save it as `<name>` |
@@ -165,6 +202,8 @@ Flags:
 | macOS / Linux: `pwsh: command not found` | Install PowerShell 7 (see Requirements). |
 | Codex Desktop still shows the old account | `codex app-server daemon restart`, or close and reopen the app. |
 | Old sessions still use the old account | Restart them — already-running processes keep the account they were started with. |
+| `limits` shows `n/a` for an account | That saved login has expired or was revoked. Refresh it: `codex-switch login <name>`. |
+| `limits` is slow | It starts a small Codex process per account and waits on the network; a few seconds per account is normal. |
 | Want to rename an account | `codex-switch remove <old>` (after switching away), then `codex-switch import <new>` or `codex-switch login <new>`. |
 
 ## Security

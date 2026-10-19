@@ -1,0 +1,4 @@
+# Codex login snapshots are credentials - never commit them
+auth*.json
+accounts/
+*.pre-login-backup

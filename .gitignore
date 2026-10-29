@@ -1,4 +1,17 @@
 # Codex login snapshots are credentials - never commit them
 auth*.json
+auth.json*
 accounts/
 *.pre-login-backup
+
+# A local Codex home, in case CODEX_HOME is ever pointed inside the repo
+.codex/
+
+# Daemon recovery archives
+*.stale-*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp

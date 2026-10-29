@@ -19,6 +19,10 @@ codex-switch limits             # see how much of each account's quota is left
 codex-switch next               # switch between them whenever you like
 ```
 
+Prefer not to use the browser? Replace the `login` line with
+`codex-switch login-device account2` to sign in with a one-time code on your
+phone instead (see [Logging in with a phone code](#logging-in-with-a-phone-code-no-browser)).
+
 ## How it works
 
 ```
@@ -108,7 +112,43 @@ codex-switch login  account2    # opens the browser to sign in your second accou
 `.`, `-`, `_`). If you are not logged in yet, run `codex login` once first, or
 use `codex-switch login account1`.
 
+If you don't want a browser sign-in, use `codex-switch login-device account2`
+instead — it shows a one-time code that you enter on your phone.
+
 Done. From now on a single command switches accounts.
+
+## Logging in with a phone code (no browser)
+
+```bash
+codex-switch login-device account3
+```
+
+Codex prints a link and a short one-time code, then waits while you approve it:
+
+```
+Device-code login: open https://auth.openai.com/codex/device on your phone,
+then enter the one-time code shown below.
+
+1. Open this link in your browser and sign in to your account
+   https://auth.openai.com/codex/device
+
+2. Enter this one-time code (expires in 15 minutes)
+   NP38-WO5F1
+```
+
+Open the link on your phone (or any device), sign in with the account you want
+to add, and enter the code. As soon as you approve it, the account is saved as
+`account3`, becomes the active login, and the command exits.
+
+- `codex-switch login-device <name>` is the same as
+  `codex-switch login <name> --device-auth`. `login-mobile` is an alias, and
+  `--device` is accepted as a shorthand.
+- The sign-in runs in an isolated temporary Codex home. If you cancel with
+  Ctrl+C or the code expires, your current account stays logged in and nothing
+  is changed.
+- The code expires after 15 minutes; if it does, run the command again.
+- Requires a Codex CLI with device-code support (current versions have it).
+  If yours doesn't, update it first with `codex update`.
 
 ## Checking your remaining limits
 
@@ -169,8 +209,10 @@ it all in one go.
 | `codex-switch list` | Show saved accounts and which one is active (`ls`, `status`) |
 | `codex-switch limits` | Show live rate-limit usage for every saved account (`usage`) |
 | `codex-switch whoami` | Show the account Codex is currently logged in with |
+| `codex-switch doctor` | Check the codex CLI, live login, saved snapshots and app-server daemon (`check`, `diagnose`) |
 | `codex-switch import <name>` | Save the current login as `<name>` |
 | `codex-switch login <name>` | Log in a new account (browser flow) and save it as `<name>` |
+| `codex-switch login-device <name>` | Log in with a one-time code on your phone, no browser (`login-mobile`; same as `login <name> --device-auth`) |
 | `codex-switch remove <name>` | Delete a saved account |
 | `codex-switch help` | Show help |
 
@@ -192,17 +234,26 @@ Flags:
   with `codex login`), nothing is lost: `codex-switch` saves it as an
   `untracked-<timestamp>` snapshot rather than overwriting anything, and
   `codex-switch list` re-detects the live account automatically.
+- Logging in never disturbs the active account: `codex-switch` runs `codex login`
+  in a temporary Codex home and only adopts the new login after it succeeds.
+- If the Codex app-server daemon crashes, Windows can reuse its old PID and Codex
+  then refuses to restart the daemon (*Access is denied*). `codex-switch` detects
+  and removes that stale state automatically on the next switch, and
+  `codex-switch doctor` does it on demand.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| `codex` won't open, or `codex app-server daemon ...` fails with *Access is denied* | A crashed daemon left a stale PID that Windows reused. Run `codex-switch doctor` (it cleans this automatically), then `codex app-server daemon start`. |
+| Codex Desktop window doesn't appear | Quit the Codex/ChatGPT app from the tray and reopen it — it may still be running in the background. |
 | `codex-switch: command not found` | Open a new terminal (PATH changes apply to new sessions), or run the launcher by full path, e.g. `& "$env:USERPROFILE\tools\codex-switch\codex-switch.cmd" list` on Windows or `~/tools/codex-switch/codex-switch list` elsewhere. |
 | Windows: *"running scripts is disabled on this system"* | Use the `.cmd` launcher (it uses `-ExecutionPolicy Bypass`), or run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once. |
 | macOS / Linux: `pwsh: command not found` | Install PowerShell 7 (see Requirements). |
 | Codex Desktop still shows the old account | `codex app-server daemon restart`, or close and reopen the app. |
 | Old sessions still use the old account | Restart them — already-running processes keep the account they were started with. |
-| `limits` shows `n/a` for an account | That saved login has expired or was revoked. Refresh it: `codex-switch login <name>`. |
+| `limits` shows `n/a` for an account | That saved login has expired or was revoked. Refresh it: `codex-switch login <name>` or `codex-switch login-device <name>`. |
+| `login-device` says the Codex CLI doesn't support `--device-auth` | Update Codex (`codex update`), then run the command again. |
 | `limits` is slow | It starts a small Codex process per account and waits on the network; a few seconds per account is normal. |
 | Want to rename an account | `codex-switch remove <old>` (after switching away), then `codex-switch import <new>` or `codex-switch login <new>`. |
 

@@ -47,6 +47,26 @@ $AccountsDir = Join-Path $CodexHome 'accounts'
 $AuthPath    = Join-Path $CodexHome 'auth.json'
 $ActivePath  = Join-Path $AccountsDir '.active'
 
+# A throwaway CODEX_HOME outside the system temp dir (avoids Codex's
+# "refusing to create helper binaries under temporary dir" warning).
+function Get-CodexTempBase {
+    $base = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:XDG_CACHE_HOME }
+    if ([string]::IsNullOrWhiteSpace($base)) {
+        $homeDir = $env:USERPROFILE
+        if ([string]::IsNullOrWhiteSpace($homeDir)) { $homeDir = $env:HOME }
+        if ([string]::IsNullOrWhiteSpace($homeDir)) { $homeDir = [System.IO.Path]::GetTempPath() }
+        $base = Join-Path $homeDir '.cache'
+    }
+    return (Join-Path $base 'codex-switch')
+}
+
+function New-CodexTempDir([string]$Purpose) {
+    $dir = Join-Path (Get-CodexTempBase) ($Purpose + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return $dir
+}
+
 $CodexExe = $null
 $codexCmd = Get-Command codex -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -in @('Application', 'ExternalScript') } | Select-Object -First 1
 if ($codexCmd) { $CodexExe = $codexCmd.Source }
@@ -200,38 +220,108 @@ function Save-LiveAuth {
 }
 
 # ---------------------------------------------------------------- daemon + clients
+function Test-DaemonPidFileLive([string]$Path) {
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $j = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        if (-not $j.pid) { return $false }
+        $p = Get-Process -Id ([int]$j.pid) -ErrorAction SilentlyContinue
+        if (-not $p -or $p.ProcessName -ne 'codex') { return $false }
+        # Guard against PID reuse: the saved process start time must match.
+        if ($j.processStartTime) {
+            try {
+                $expected = [DateTime]::FromFileTimeUtc([long]$j.processStartTime)
+                $actual = $p.StartTime.ToUniversalTime()
+                if ([math]::Abs(($actual - $expected).TotalSeconds) -gt 60) { return $false }
+            } catch { }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# Codex can leave daemon.pid behind after a crash. If Windows reuses that PID,
+# "codex app-server daemon restart/start" fails with "Access is denied" until
+# the stale file and the dead control socket are removed.
+function Test-DaemonResponding {
+    if (-not $CodexExe) { return $false }
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $CodexExe app-server daemon version 1>$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+    finally { $ErrorActionPreference = $oldEAP }
+}
+
+function Repair-StaleDaemonState {
+    $daemonDir = Join-Path $CodexHome 'app-server-daemon'
+    $pidFile = Join-Path $daemonDir 'daemon.pid'
+    if (-not $CodexExe) { return $false }
+    if (-not (Test-Path $pidFile)) { return $false }
+    if (Test-DaemonPidFileLive $pidFile) { return $false }
+    # The PID file looks stale, but only clean up if the daemon really is not
+    # answering over its control socket (the file could just be unreadable).
+    if (Test-DaemonResponding) { return $false }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    try {
+        Move-Item -Path $pidFile -Destination "$pidFile.stale-$stamp" -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+    }
+    $sock = Join-Path (Join-Path $CodexHome 'app-server-control') 'app-server-control.sock'
+    Remove-Item -Path $sock -Force -ErrorAction SilentlyContinue
+
+    Write-WarnMsg '! The Codex app-server daemon left a stale PID file (its old PID was reused by another process); cleaned it up.'
+    return $true
+}
+
 function Test-DaemonRunning {
     $pidFile = Join-Path (Join-Path $CodexHome 'app-server-daemon') 'daemon.pid'
-    if (Test-Path $pidFile) {
-        try {
-            $j = Get-Content -Path $pidFile -Raw | ConvertFrom-Json
-            if ($j.pid) {
-                $p = Get-Process -Id ([int]$j.pid) -ErrorAction SilentlyContinue
-                if ($p -and $p.ProcessName -eq 'codex') { return $true }
-            }
-        } catch { }
-    }
-    $daemons = @(Get-Process -Name 'codex' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*app-server-daemon*' })
-    return ($daemons.Count -gt 0)
+    if (Test-DaemonPidFileLive $pidFile) { return $true }
+    return (Test-DaemonResponding)
 }
 
 function Offer-DaemonRestart {
+    $repaired = Repair-StaleDaemonState
     $daemonRunning = Test-DaemonRunning
     $clients = @(Get-Process -Name 'codex' -ErrorAction SilentlyContinue)
-    if (-not $daemonRunning -and $clients.Count -eq 0) { return }
+    if (-not $daemonRunning -and $clients.Count -eq 0) {
+        if ($repaired) {
+            Write-Host '  Start it again with:  codex app-server daemon start'
+            Write-Host ''
+        }
+        return
+    }
     Write-Host ''
     if ($daemonRunning) {
         Write-WarnMsg '! The Codex app-server daemon (Desktop app / IDE backend) is running and keeps the OLD account until restarted.'
     } elseif ($clients.Count -gt 0) {
         Write-WarnMsg '! Other codex sessions are still running; they keep the old account until restarted.'
     }
+    if ($repaired) {
+        Write-Host '  The daemon is not running right now; start it again with:  codex app-server daemon start'
+    }
     Write-Host "  New terminal sessions ('codex', 'codex resume') pick up the new account immediately."
     if ($daemonRunning -and $CodexExe) {
         if (Confirm-Action 'Restart the app-server daemon now so Desktop/IDE use the new account? Interrupts any in-flight Desktop/IDE task. [y/N] ') {
             Write-Step 'Restarting app-server daemon...'
-            & $CodexExe app-server daemon restart
-            if ($LASTEXITCODE -eq 0) { Write-Ok 'App-server daemon restarted.' }
-            else { Write-WarnMsg "! Restart failed (exit $LASTEXITCODE). Run manually: codex app-server daemon restart" }
+            # Windows PowerShell 5.1 turns redirected native stderr into error
+            # records; keep EAP=Continue so the daemon's JSON log can't abort us.
+            $oldEAP = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = & $CodexExe app-server daemon restart 2>&1 | Out-String
+                $restartExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $oldEAP
+            }
+            if ($restartExit -eq 0) {
+                Write-Ok 'App-server daemon restarted.'
+            } else {
+                Write-WarnMsg "! Restart failed (exit $restartExit). Run manually: codex app-server daemon restart"
+                if ($output.Trim()) { Write-Host ('  ' + ($output.Trim() -replace "`r?`n", "`n  ")) }
+            }
         } else {
             Write-Host '  Skipped. To apply it later:  codex app-server daemon restart'
         }
@@ -301,12 +391,12 @@ function Invoke-RateLimitQuery {
     if (-not $CodexExe) { $out.Error = 'codex executable not found on PATH'; return $out }
     if (-not (Test-Path $AuthFile)) { $out.Error = 'saved login not found'; return $out }
 
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-switch-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $tmp = $null
     $tmpAuth = $null
     $before = $null
     $proc = $null
     try {
-        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $tmp = New-CodexTempDir 'limits'
         $tmpAuth = Join-Path $tmp 'auth.json'
         Copy-Item -Path $AuthFile -Destination $tmpAuth -Force
         $before = (Get-FileHash -Path $tmpAuth -Algorithm SHA256).Hash
@@ -380,7 +470,7 @@ function Invoke-RateLimitQuery {
                 if ($before -and $after -ne $before) { $out.NewAuth = Get-Content -Path $tmpAuth -Raw }
             } catch { }
         }
-        Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        if ($tmp) { Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
     return $out
 }
@@ -594,33 +684,63 @@ function Invoke-Login([string]$Target, [string[]]$CodexArgs) {
         Write-Host 'Cancelled.'
         return
     }
-    Save-LiveAuth | Out-Null
-    $pending = Join-Path $CodexHome 'auth.json.pre-login-backup'
-    $hadLive = Test-Path $AuthPath
-    if ($hadLive) { Copy-Item -Path $AuthPath -Destination $pending -Force }
+
+    $deviceMode = ($CodexArgs -contains '--device-auth')
+    if ($deviceMode) {
+        $loginHelp = ''
+        try { $loginHelp = (& $CodexExe login --help 2>&1 | Out-String) } catch { }
+        if ($loginHelp -notmatch '--device-auth') {
+            Write-ErrMsg "This Codex CLI does not support '--device-auth' (device-code login)."
+            Write-Host 'Update Codex first:  codex update'
+            exit 1
+        }
+    }
+
+    # Sign in inside an isolated CODEX_HOME, so the currently active account
+    # keeps working even if this login is cancelled, fails or expires.
+    $loginHome = New-CodexTempDir 'login'
+    $loginExit = 0
     try {
-        if ($hadLive) { Remove-Item -Path $AuthPath -Force }
-        Write-Step "Launching 'codex login' - finish the sign-in in your browser..."
-        if ($CodexArgs -and $CodexArgs.Count -gt 0) { & $CodexExe login @CodexArgs } else { & $CodexExe login }
-        if ($LASTEXITCODE -ne 0) { throw ("codex login exited with code {0}" -f $LASTEXITCODE) }
-        $new = Read-AuthFile $AuthPath
+        if ($deviceMode) {
+            Write-Step 'Device-code login: open https://auth.openai.com/codex/device on your phone,'
+            Write-Step 'then enter the one-time code shown below.'
+        } else {
+            Write-Step "Launching 'codex login' - finish the sign-in in your browser..."
+        }
+        Write-Host ''
+
+        $savedCodexHome = $env:CODEX_HOME
+        try {
+            $env:CODEX_HOME = $loginHome
+            if ($CodexArgs -and $CodexArgs.Count -gt 0) { & $CodexExe login @CodexArgs } else { & $CodexExe login }
+            $loginExit = $LASTEXITCODE
+        } finally {
+            if ([string]::IsNullOrWhiteSpace($savedCodexHome)) {
+                Remove-Item Env:\CODEX_HOME -ErrorAction SilentlyContinue
+            } else {
+                $env:CODEX_HOME = $savedCodexHome
+            }
+        }
+
+        if ($loginExit -ne 0) { throw ("codex login exited with code {0}" -f $loginExit) }
+        $newAuthPath = Join-Path $loginHome 'auth.json'
+        $new = Read-AuthFile $newAuthPath
         if ($null -eq $new) { throw 'codex login finished but no readable auth.json was produced' }
-        Copy-Item -Path $AuthPath -Destination $dest -Force
+
+        # Keep the previously active account's snapshot current, then adopt the new login.
+        Save-LiveAuth | Out-Null
+        Copy-Item -Path $newAuthPath -Destination $dest -Force
+        Copy-Item -Path $newAuthPath -Destination $AuthPath -Force
         Set-ActiveName $Target
+
         Write-Ok ("Logged in as '{0}' ({1})." -f $Target, (Format-Identity (Get-AuthIdentity $new)))
         foreach ($other in @(Get-AccountNames | Where-Object { $_ -ne $Target })) {
             if (Test-SameAccount $new (Read-AuthFile (Get-AccountPath $other))) {
                 Write-WarnMsg ("! '{0}' is the same ChatGPT account as '{1}'." -f $Target, $other)
             }
         }
-        if (Test-Path $pending) { Remove-Item -Path $pending -Force }
-    } catch {
-        if (Test-Path $pending) {
-            Copy-Item -Path $pending -Destination $AuthPath -Force
-            Remove-Item -Path $pending -Force
-            Write-WarnMsg 'Login cancelled or failed - previous login restored.'
-        }
-        throw
+    } finally {
+        Remove-Item -Path $loginHome -Recurse -Force -ErrorAction SilentlyContinue
     }
     Offer-DaemonRestart
 }
@@ -638,6 +758,63 @@ function Invoke-Remove([string]$Target) {
     Write-Ok "Removed '$Target'."
 }
 
+function Invoke-Doctor {
+    Write-Host ''
+    Write-Host 'codex-switch doctor' -ForegroundColor Cyan
+    Write-Host ''
+
+    if ($CodexExe) {
+        $ver = ''
+        $oldEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $ver = (& $CodexExe --version 2>&1 | Out-String).Trim() } catch { }
+        finally { $ErrorActionPreference = $oldEAP }
+        if (-not $ver) { $ver = 'found' }
+        Write-Ok ("codex CLI      : {0}" -f $ver)
+        Write-Host ("  path         : {0}" -f $CodexExe)
+    } else {
+        Write-ErrMsg 'codex CLI      : NOT FOUND on PATH'
+    }
+
+    $live = Read-AuthFile $AuthPath
+    if ($live) {
+        Write-Ok ("live auth      : {0}" -f (Format-Identity (Get-AuthIdentity $live)))
+    } else {
+        Write-ErrMsg 'live auth      : missing or unreadable (run: codex login)'
+    }
+
+    $names = @(Get-AccountNames)
+    if ($names.Count -gt 0) {
+        Write-Ok ("saved accounts : {0}" -f ($names -join ', '))
+        foreach ($n in $names) {
+            if ($null -eq (Read-AuthFile (Get-AccountPath $n))) {
+                Write-WarnMsg ("! snapshot '{0}' is unreadable" -f $n)
+            }
+        }
+    } else {
+        Write-WarnMsg 'saved accounts : none (run: codex-switch import <name>)'
+    }
+
+    $repaired = Repair-StaleDaemonState
+    if (Test-DaemonRunning) {
+        Write-Ok 'app-server     : running'
+    } elseif ($repaired) {
+        Write-WarnMsg 'app-server     : stopped (stale state cleaned; start: codex app-server daemon start)'
+    } else {
+        Write-WarnMsg 'app-server     : not running (optional; Desktop/IDE starts it when needed)'
+    }
+
+    $tempDir = Get-CodexTempBase
+    $leftovers = @(Get-ChildItem $tempDir -Directory -ErrorAction SilentlyContinue)
+    if ($leftovers.Count -gt 0) {
+        Write-WarnMsg ("temp leftovers : {0} folder(s) in {1}" -f $leftovers.Count, $tempDir)
+        Write-Host  '  Safe to delete when no codex-switch command is running.'
+    } else {
+        Write-Ok 'temp leftovers : none'
+    }
+    Write-Host ''
+}
+
 function Show-Help {
     @'
 codex-switch - switch between multiple Codex accounts, sharing one local workspace
@@ -652,8 +829,12 @@ Commands:
   limits                   Show live rate-limit usage for every saved account. (usage)
   whoami                   Show the account Codex is currently logged in with.
   import <name>            Save the CURRENT login (auth.json) as <name>.
-  login <name> [args...]   Log in a new account (runs "codex login": browser flow),
-                           then saves it as <name>. Extra args go to "codex login".
+  login <name> [args...]   Log in a new account, then save it as <name>.
+                           Default: browser flow. Extra args go to "codex login".
+                           Tip: add --device (or use login-device) for a phone code.
+  login-device <name>      Log in using a one-time code on your phone - no browser.
+                           Alias: login-mobile. Same as: login <name> --device-auth
+  doctor                   Check the codex CLI, login, saved snapshots and app-server daemon.
   remove <name>            Delete a saved account. (rm / delete)
   help                     Show this help.
 
@@ -692,15 +873,24 @@ if ($cmd -in @('import', 'add', 'init', 'save')) {
     if (-not $Name) { Write-ErrMsg 'Usage: codex-switch import <name>'; exit 1 }
     Invoke-Import $Name; exit 0
 }
-if ($cmd -in @('login', 'signin', 'new')) {
+if ($cmd -in @('login', 'signin', 'new', 'login-device', 'login-mobile')) {
     if (-not $Name) { Write-ErrMsg 'Usage: codex-switch login <name> [extra args for codex login]'; exit 1 }
-    Invoke-Login $Name $Extra; exit 0
+    $loginArgs = @()
+    if ($Extra) { $loginArgs += $Extra }
+    if ($cmd -in @('login-device', 'login-mobile')) {
+        if ($loginArgs -notcontains '--device-auth') { $loginArgs = @('--device-auth') + $loginArgs }
+    } elseif ($loginArgs -contains '--device') {
+        # friendly shorthand: --device -> --device-auth
+        $loginArgs = @($loginArgs | ForEach-Object { if ($_ -eq '--device') { '--device-auth' } else { $_ } })
+    }
+    Invoke-Login $Name $loginArgs; exit 0
 }
 if ($cmd -in @('remove', 'rm', 'delete', 'del')) {
     if (-not $Name) { Write-ErrMsg 'Usage: codex-switch remove <name>'; exit 1 }
     Invoke-Remove $Name; exit 0
 }
 if ($cmd -in @('whoami', 'current', 'me')) { Show-Whoami; exit 0 }
+if ($cmd -in @('doctor', 'check', 'diagnose', 'health')) { Invoke-Doctor; exit 0 }
 if ($cmd -in @('help', '-h', '--help', '/?', '-?')) { Show-Help; exit 0 }
 
 if (@(Get-AccountNames) -contains $Command) { Invoke-SwitchAccount $Command; exit 0 }
